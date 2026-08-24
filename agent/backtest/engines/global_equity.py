@@ -24,6 +24,7 @@ India (NSE/BSE) is handled by the dedicated ``backtest.engines.india_equity``
 from __future__ import annotations
 
 import math
+from decimal import Decimal, ROUND_HALF_UP
 
 import pandas as pd
 
@@ -42,6 +43,10 @@ class GlobalEquityEngine(BaseEngine):
       - hk_settlement: default 0.00002 (CCASS)
       - slippage_ca: defaults to slippage_us
       - ca_commission: broker commission rate, default 0.0
+      - slippage_uk: defaults to slippage_us
+      - uk_stamp_tax: default 0.005 (0.5% Stamp Duty Reserve Tax on
+        purchases only; chargeable on the buyer, paid on buying to close
+        short positions too)
     """
 
     def __init__(self, config: dict, market: str = "us"):
@@ -61,6 +66,13 @@ class GlobalEquityEngine(BaseEngine):
         # rate instead of inventing an exchange-wide charge.
         self.slippage_ca: float = config.get("slippage_ca", self.slippage_us)
         self.ca_commission: float = config.get("ca_commission", 0.0)
+        # UK defaults. LSE has no broker-commission model; the exchange-level
+        # cost is SDRT: 0.5% on the buyer of Main Market equities, rounded to
+        # the nearest penny (FA86/S99(13); exact ½p rounds up). Exemptions —
+        # qualifying UCITS ETFs, AIM shares, gilts, new issues — are the
+        # caller's concern; this engine applies the statutory Main Market rate.
+        self.slippage_uk: float = config.get("slippage_uk", self.slippage_us)
+        self.uk_stamp_tax: float = config.get("uk_stamp_tax", 0.005)
 
     def can_execute(self, symbol: str, direction: int, bar: pd.Series) -> bool:
         """US/HK/Canada: same-session trading, both directions allowed."""
@@ -80,11 +92,14 @@ class GlobalEquityEngine(BaseEngine):
             return float(math.floor(max(raw_size, 0.0)))
         return round(max(raw_size, 0.0), 2)
 
-    def calc_commission(self, size: float, price: float, _direction: int, is_open: bool) -> float:
-        """US: zero; HK: stamp tax + levies; Canada: configured broker rate.
+    def calc_commission(self, size: float, price: float, direction: int, is_open: bool) -> float:
+        """US: zero; HK: stamp tax + levies; Canada: configured broker rate;
+        UK: SDRT on the buyer only.
 
-        ``_direction`` is unused — reserved for future short-borrow fees
-        (US Reg-T margin, HK SBL costs).
+        ``direction`` is the order/position side (1=buy-long/short-cover,
+        -1=sell/short). Trade side is direction on opens and -direction on
+        closes (closing a long sells; covering a short buys). UK SDRT applies
+        to purchases of every kind: opening long and buying to cover.
         """
         if self.market == "hk":
             notional = size * price
@@ -95,6 +110,22 @@ class GlobalEquityEngine(BaseEngine):
             return comm
         if self.market == "ca":
             return size * price * self.ca_commission
+        if self.market == "uk":
+            # SDRT is a purchase-side charge only: 0.5% of consideration on
+            # the buyer, rounded to the nearest penny (FA86/S99(13); an exact
+            # ½p rounds UP). Python's float round() is banker's rounding and
+            # handles 1.005 inconsistently (-> 1.00), so use Decimal
+            # ROUND_HALF_UP for the statutory direction.
+            #
+            # While open orders carry buyer/seller as the sign directly, a
+            # CLOSE passes the *position* side: closing a long (direction=1)
+            # is a sale, covering a short (direction=-1) is a purchase.
+            trade_is_buy = direction > 0 if is_open else direction < 0
+            if trade_is_buy:
+                consideration = Decimal(str(size)) * Decimal(str(price))
+                tax = consideration * Decimal(str(self.uk_stamp_tax))
+                return float(tax.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            return 0.0
         # US: zero commission (SEC fee negligible)
         return 0.0
 

@@ -28,6 +28,10 @@ _SOURCE_PATTERNS = [
     (re.compile(r"^[A-Z0-9&.\-]+\.(NS|BO)$", re.I), "yahoo"),
     # Canada: Toronto Stock Exchange (TD.TO) / TSX Venture (PNG.V).
     (re.compile(r"^[A-Z0-9&.\-]+\.(TO|V)$", re.I), "yahoo"),
+    # UK: London Stock Exchange (VOD.L, SHEL.L) / Irish (DCC.IL). Yahoo serves
+    # both suffixes verbatim; without this they fell through to the tushare
+    # default and were routed to China-market loaders that cannot resolve them.
+    (re.compile(r"^[A-Z0-9&.\-]+\.(L|IL)$", re.I), "yahoo"),
     # Yahoo futures (GC=F, CL=F) and forex (EURUSD=X) suffix conventions —
     # served verbatim by Yahoo's public chart endpoint (#718). Without these,
     # such symbols fell through to the ``tushare`` default and were routed to
@@ -258,12 +262,19 @@ def fetch_market_data(
         results[symbol] = cap_rows(records, max_rows)
         if include_provenance:
             volume_units = getattr(provider_cls, "volume_units", None) or {}
+            price_units = getattr(provider_cls, "price_units", None) or {}
+            if price_units.get(market):
+                # Loader normalizes GBp-quoted UK prices to GBP at fetch
+                # (#1206); declare the applied conversion explicitly.
+                currency_conversion = f"GBp→{price_units[market]} (÷100)"
+            else:
+                currency_conversion = "none"
             entry: dict[str, Any] = {
                 "source": used_source or src,
                 "requested_source": source,
                 "detected_source": src,
                 "fallback_used": bool(used_source and used_source != src),
-                "currency_conversion": "none",
+                "currency_conversion": currency_conversion,
                 "volume_unit": volume_units.get(market),
             }
             if extra_provenance:
